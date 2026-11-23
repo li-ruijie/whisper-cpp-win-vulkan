@@ -1,0 +1,336 @@
+name: Build whisper.cpp for Windows with Vulkan
+
+on:
+  schedule:
+    - cron: '30 5 * * *'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semantic tag override, for example v1.9.5. Empty means the newest one."
+        required: false
+        type: string
+      force:
+        description: "Rebuild even when a release for the tag already carries both assets"
+        required: false
+        default: false
+        type: boolean
+
+permissions: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  # The release asset names are consumed by the whisper-cpp-vulkan manifest in
+  # li-ruijie/scoop, whose autoupdate breaks if either is renamed.
+  ASSET: whisper-bin-win-vulkan-x64.zip
+  SUMS: SHA256SUMS.txt
+  # Dependabot cannot bump either pin. The Vulkan SDK follows the version
+  # llama.cpp builds its own Windows release with, and SDL2 follows upstream.
+  VULKAN_VERSION: 1.4.357.0
+  SDL2_VERSION: 2.28.5
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      latest: ${{ steps.resolve.outputs.latest }}
+      skip: ${{ steps.resolve.outputs.skip }}
+    steps:
+      - name: Resolve the upstream tag and decide whether to build
+        id: resolve
+        env:
+          VERSION_OVERRIDE: ${{ inputs.version }}
+          FORCE: ${{ inputs.force }}
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Deliberately not releases/latest. From v1.9.3 upstream may cut the
+          # semantic release as a prerelease and publish its binaries on a b<N>
+          # nightly, so latest can return a nightly whose tag is no version.
+          # Only the tag is needed, since the build is from source. One page is
+          # enough, as a semantic tag lands far more often than every 100
+          # releases. Authenticated, since the anonymous limit is shared by
+          # every job on the runner's address.
+          NEWEST=$(gh api 'repos/ggml-org/whisper.cpp/releases?per_page=100' \
+            --jq '[.[] | select(.tag_name | test("^v[0-9]"))] | first | .tag_name')
+          TAG="${VERSION_OVERRIDE:-$NEWEST}"
+
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::'$TAG' is not a semantic upstream tag"
+            exit 1
+          fi
+          gh api "repos/ggml-org/whisper.cpp/git/ref/tags/$TAG" --silent \
+            || { echo "::error::upstream has no tag $TAG"; exit 1; }
+
+          # A release counts as published only when it carries both assets, so
+          # a publish that failed halfway is retried by the next scheduled run.
+          # Any failure other than a 404 fails the job rather than reading as
+          # nothing published.
+          assets=""
+          if out=$(gh api "repos/$REPO/releases/tags/$TAG" --jq '.assets[].name' 2>&1); then
+            assets="$out"
+          elif [[ "$out" != *"HTTP 404"* ]]; then
+            echo "::error::$out"
+            exit 1
+          fi
+          if grep -qxF "$ASSET" <<<"$assets" && grep -qxF "$SUMS" <<<"$assets"; then
+            published=true
+          else
+            published=false
+          fi
+
+          skip=false
+          if [ "$published" = true ] && [ "$FORCE" != true ]; then
+            skip=true
+          fi
+          # An override naming an older version must not take the latest
+          # marker, which the Scoop manifest reads, from the newest build.
+          latest=false
+          [ "$TAG" = "$NEWEST" ] && latest=true
+
+          echo "Upstream $TAG, newest $NEWEST, published $published, skip $skip"
+          {
+            echo "tag=$TAG"
+            echo "latest=$latest"
+            echo "skip=$skip"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.skip == 'false'
+    # Pinned rather than windows-latest, since a moving label would change the
+    # MSVC toolchain, and with it the runtime the binaries need, unannounced.
+    runs-on: windows-2025
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      TAG: ${{ needs.check.outputs.tag }}
+    steps:
+      - name: Checkout whisper.cpp
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ggml-org/whisper.cpp
+          ref: ${{ needs.check.outputs.tag }}
+          path: whisper.cpp
+          persist-credentials: false
+
+      - name: Add msbuild to PATH
+        uses: microsoft/setup-msbuild@30375c66a4eea26614e0d39710365f22f8b0af57 # v3.0.0
+
+      - name: Install the Vulkan SDK
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          curl.exe -fsSL --retry 3 -o $installer `
+            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          # LunarG publishes no checksum beside the installer, so its
+          # Authenticode signature is what ties it to LunarG.
+          $sig = Get-AuthenticodeSignature $installer
+          Write-Host "Signature $($sig.Status), signer $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notmatch 'LunarG') {
+            throw "The Vulkan SDK installer is not validly signed by LunarG"
+          }
+          # Start-Process -Wait, since a call operator returns immediately when
+          # the installer is a GUI-subsystem executable.
+          $p = Start-Process -FilePath $installer -Wait -PassThru `
+            -ArgumentList '--accept-licenses', '--default-answer', '--confirm-command', 'install'
+          if ($p.ExitCode -ne 0) { throw "The Vulkan SDK installer exited with $($p.ExitCode)" }
+          $sdk = "C:\VulkanSDK\$env:VULKAN_VERSION"
+          if (-not (Test-Path "$sdk\Bin\glslc.exe")) { throw "glslc.exe is missing from $sdk\Bin" }
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdk"
+          Add-Content $env:GITHUB_PATH "$sdk\Bin"
+
+      - name: Fetch SDL2
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $v = $env:SDL2_VERSION
+          $zip = "$env:RUNNER_TEMP\sdl2.zip"
+          curl.exe -fsSL --retry 3 -o $zip `
+            "https://github.com/libsdl-org/SDL/releases/download/release-$v/SDL2-devel-$v-VC.zip"
+          Write-Host "SDL2-devel-$v-VC.zip SHA256 $((Get-FileHash -Algorithm SHA256 $zip).Hash)"
+          Expand-Archive $zip -DestinationPath $env:RUNNER_TEMP
+          Add-Content $env:GITHUB_ENV "SDL2_DIR=$env:RUNNER_TEMP\SDL2-$v\cmake"
+
+      # Upstream's own Windows x64 release configuration, plus GGML_VULKAN.
+      - name: Configure
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          cmake -S whisper.cpp -B build -A x64 `
+            -DCMAKE_BUILD_TYPE=Release `
+            -DBUILD_SHARED_LIBS=ON `
+            -DWHISPER_SDL2=ON `
+            -DGGML_NATIVE=OFF `
+            -DWHISPER_BUILD_IS_DEV=OFF `
+            -DGGML_BACKEND_DL=ON `
+            -DGGML_CPU_ALL_VARIANTS=ON `
+            -DGGML_VULKAN=ON
+
+      - name: Build
+        working-directory: build
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          msbuild ALL_BUILD.vcxproj -t:build -p:configuration=Release -p:platform=x64 -m -v:minimal
+
+      - name: Copy SDL2.dll beside the executables
+        run: Copy-Item "$env:SDL2_DIR\..\lib\x64\SDL2.dll" build\bin\Release
+
+      - name: Check the expected files were built
+        working-directory: build/bin/Release
+        run: |
+          Get-ChildItem | Format-Table Name, Length -AutoSize | Out-String -Width 200 | Write-Host
+          # Every variant ggml builds under MSVC at v1.9.5. An upstream rename
+          # or removal fails here rather than shipping a narrower set unnoticed.
+          $variants = 'x64', 'sse42', 'sandybridge', 'haswell', 'skylakex', 'cannonlake',
+                      'cascadelake', 'icelake', 'alderlake'
+          $required = @('whisper-cli.exe', 'whisper-server.exe', 'whisper.dll', 'ggml.dll',
+                        'ggml-base.dll', 'ggml-vulkan.dll', 'SDL2.dll') +
+                      ($variants | ForEach-Object { "ggml-cpu-$_.dll" })
+          $missing = $required | Where-Object { -not (Test-Path $_) }
+          if ($missing) { throw "Missing from build\bin\Release: $($missing -join ', ')" }
+          # The Vulkan loader belongs to the GPU driver. A copy in the zip would
+          # shadow the system loader with whatever the SDK happened to carry.
+          if (Test-Path vulkan-1.dll) { throw "vulkan-1.dll must not be shipped" }
+
+      # The SDK is on PATH here, so a backend linking an SDK-only library such
+      # as shaderc would load on this runner and fail on a user's machine,
+      # where ggml would drop it and fall back to CPU without saying why.
+      - name: Check ggml-vulkan.dll imports only the loader, ggml, and the runtime
+        working-directory: build/bin/Release
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $dumpbin = & $vswhere -latest -products * -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' |
+                     Select-Object -First 1
+          if (-not $dumpbin) { throw "dumpbin.exe was not found" }
+          function Get-Imports($file) {
+            & $dumpbin /nologo /dependents $file |
+              ForEach-Object { if ($_ -match '^\s+(\S+\.dll)\s*$') { $Matches[1] } }
+          }
+
+          # Diagnostic, recording which runtime DLLs the shipped binaries need.
+          Get-ChildItem *.dll, *.exe | ForEach-Object {
+            Write-Host "$($_.Name): $((Get-Imports $_.FullName) -join ', ')"
+          }
+
+          $imports = Get-Imports ggml-vulkan.dll
+          $allowed = '^(vulkan-1|ggml-base|KERNEL32|MSVCP140(_\w+)?|VCRUNTIME140(_\d+)?|api-ms-win-crt-[\w-]+)\.dll$'
+          $stray = $imports | Where-Object { $_ -notmatch $allowed }
+          if ($stray) { throw "ggml-vulkan.dll imports undeclared libraries: $($stray -join ', ')" }
+          foreach ($need in 'vulkan-1.dll', 'ggml-base.dll') {
+            if ($imports -notcontains $need) { throw "ggml-vulkan.dll does not import $need" }
+          }
+
+      - name: Package
+        run: |
+          $stage = "$env:RUNNER_TEMP\stage"
+          New-Item -ItemType Directory $stage, dist | Out-Null
+          Copy-Item build\bin\Release\* $stage
+          Copy-Item whisper.cpp\LICENSE "$stage\LICENSE"
+          # SDL renamed COPYING.txt to LICENSE.txt in its source tree in 2.24,
+          # and the name inside the VC development zip is not documented.
+          $sdlLicence = 'LICENSE.txt', 'COPYING.txt' |
+                        ForEach-Object { Join-Path "$env:SDL2_DIR\.." $_ } |
+                        Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $sdlLicence) { throw "No licence file found in the SDL2 package" }
+          Copy-Item $sdlLicence "$stage\LICENSE-SDL2.txt"
+          # Files at the zip root, so the archive extracts straight into place.
+          Compress-Archive -Path "$stage\*" -DestinationPath "dist\$env:ASSET"
+          $hash = (Get-FileHash -Algorithm SHA256 "dist\$env:ASSET").Hash.ToLower()
+          # Two spaces and an LF, the sha256sum format that sha256sum -c reads.
+          [IO.File]::WriteAllText("$PWD\dist\$env:SUMS", "$hash  $env:ASSET`n")
+          Get-Content "dist\$env:SUMS"
+
+      # Runs from the packaged zip, so a file left out of it fails here. The
+      # runner has no GPU, so this proves the CPU path and that the Vulkan
+      # backend's presence does not break startup. It never exercises Vulkan.
+      - name: Smoke test the packaged zip
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $dir = "$env:RUNNER_TEMP\smoke"
+          Expand-Archive "dist\$env:ASSET" -DestinationPath $dir
+          $model = "$env:RUNNER_TEMP\ggml-tiny.en.bin"
+          curl.exe -fsSL --retry 3 -o $model `
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin
+          # The LFS object ID Hugging Face records for the file.
+          $want = '921e4cf8686fdd993dcd081a5da5b6c365bfde1162e72b08d75ac75289920b1f'
+          $got = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLower()
+          if ($got -ne $want) { throw "ggml-tiny.en.bin SHA256 $got, expected $want" }
+
+          # Without the SDK on PATH, as on a user's machine.
+          $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'VulkanSDK' }) -join ';'
+          $text = & "$dir\whisper-cli.exe" -m $model -f whisper.cpp\samples\jfk.wav -nt `
+                    2> "$env:RUNNER_TEMP\stderr.log"
+          Get-Content "$env:RUNNER_TEMP\stderr.log" | Write-Host
+          $text = $text -join "`n"
+          Write-Host "Transcript: $text"
+          if ($text -notmatch 'ask not what your country can do for you') {
+            throw "The transcript does not contain the expected sentence"
+          }
+
+      - name: Upload the release assets
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [check, build]
+    if: needs.check.outputs.skip == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release assets
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release
+          path: dist
+
+      - name: Verify the checksum file against the zip
+        working-directory: dist
+        run: |
+          ls -la
+          sha256sum -c "$SUMS"
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          TAG: ${{ needs.check.outputs.tag }}
+          LATEST: ${{ needs.check.outputs.latest }}
+        run: |
+          set -euo pipefail
+          notes="Built from ggml-org/whisper.cpp $TAG with MSVC, the Vulkan backend, and every CPU
+          variant, using Vulkan SDK $VULKAN_VERSION. whisper.cpp is MIT licensed, and the zip bundles
+          SDL2 $SDL2_VERSION under the zlib licence. The Visual C++ 2015-2022 runtime must be installed.
+          The build machine has no GPU, so CI tests the CPU path only."
+          notes=$(printf '%s\n' "$notes" | sed 's/^ *//')
+          # -R is required, as this job has no checkout from which gh could
+          # infer the repository.
+          #
+          # A forced rebuild reuses the tag. Deleting the release first would
+          # open a window in which a failed upload loses the old release, the
+          # new one, and the tag. Uploading over it with --clobber has none.
+          if gh release view "$TAG" -R "$REPO" > /dev/null 2>&1; then
+            echo "Updating the existing release for $TAG in place"
+            gh release upload "$TAG" "dist/$ASSET" "dist/$SUMS" -R "$REPO" --clobber
+            gh release edit "$TAG" -R "$REPO" --notes "$notes"
+          else
+            gh release create "$TAG" "dist/$ASSET" "dist/$SUMS" -R "$REPO" \
+              --target "$GITHUB_SHA" \
+              --title "whisper.cpp $TAG for Windows with Vulkan" \
+              --notes "$notes" \
+              --latest="$LATEST"
+          fi
