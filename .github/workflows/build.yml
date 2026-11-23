@@ -338,6 +338,11 @@ jobs:
           # -R is required, as this job has no checkout from which gh could
           # infer the repository.
           #
+          # No --target, so the tag lands on the head of main. Targeting the
+          # commit that built the release fails with HTTP 403 whenever main has
+          # since changed a workflow file, as GITHUB_TOKEN cannot create a ref
+          # that differs from main in .github/workflows.
+          #
           # A forced rebuild reuses the tag. Deleting the release first would
           # open a window in which a failed upload loses the old release, the
           # new one, and the tag. Uploading over it with --clobber has none.
@@ -347,7 +352,6 @@ jobs:
             gh release edit "$TAG" -R "$REPO" --notes "$notes"
           else
             gh release create "$TAG" "dist/$ASSET" "dist/$SUMS" -R "$REPO" \
-              --target "$GITHUB_SHA" \
               --title "whisper.cpp $TAG for Windows with Vulkan" \
               --notes "$notes" \
               --latest="$LATEST"
