@@ -287,7 +287,10 @@ jobs:
           $got = (Get-FileHash -Algorithm SHA256 $model).Hash.ToLower()
           if ($got -ne $want) { throw "ggml-tiny.en.bin SHA256 $got, expected $want" }
 
-          # Without the SDK on PATH, as on a user's machine.
+          # Without the SDK on PATH, as on a user's machine. The log records
+          # whether a system Vulkan loader exists, since without one ggml skips
+          # the Vulkan backend silently and this run covers that fallback.
+          Write-Host "System Vulkan loader present: $(Test-Path "$env:SystemRoot\System32\vulkan-1.dll")"
           $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'VulkanSDK' }) -join ';'
           $text = & "$dir\whisper-cli.exe" -m $model -f whisper.cpp\samples\jfk.wav -nt `
                     2> "$env:RUNNER_TEMP\stderr.log"
