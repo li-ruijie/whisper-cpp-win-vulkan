@@ -148,8 +148,8 @@ jobs:
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
           $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
-          curl.exe -fsSL --retry 3 -o $installer `
-            "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
+          $base = "https://sdk.lunarg.com/sdk/download/$env:VULKAN_VERSION/windows"
+          curl.exe -fsSL --retry 3 -o $installer "$base/vulkansdk-windows-X64-$env:VULKAN_VERSION.exe"
           # LunarG publishes no checksum beside the installer, so its
           # Authenticode signature is what ties it to LunarG.
           $sig = Get-AuthenticodeSignature $installer
@@ -244,7 +244,8 @@ jobs:
           }
 
           $imports = Get-Imports ggml-vulkan.dll
-          $allowed = '^(vulkan-1|ggml-base|KERNEL32|MSVCP140(_\w+)?|VCRUNTIME140(_\d+)?|api-ms-win-crt-[\w-]+)\.dll$'
+          $allowed = '^(vulkan-1|ggml-base|KERNEL32|MSVCP140(_\w+)?|VCRUNTIME140(_\d+)?|' +
+                     'api-ms-win-crt-[\w-]+)\.dll$'
           $stray = $imports | Where-Object { $_ -notmatch $allowed }
           if ($stray) { throw "ggml-vulkan.dll imports undeclared libraries: $($stray -join ', ')" }
           foreach ($need in 'vulkan-1.dll', 'ggml-base.dll') {
