@@ -32,6 +32,24 @@ env:
   SDL2_VERSION: 2.28.5
 
 jobs:
+  # GitHub disables the schedule of a public repository after 60 days without
+  # activity, and this one rarely changes once it works, so the daily build
+  # would stop with no error. Re-enabling the workflow on every run is meant to
+  # restart that count, which GitHub does not document. It depends on no other
+  # job, so it runs on days when nothing is built or a build fails. The REST
+  # call is used because gh workflow enable resolves only disabled workflows
+  # and fails on an active one.
+  keepalive:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write
+    steps:
+      - name: Re-enable this workflow
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/$GITHUB_REPOSITORY/actions/workflows/build.yml/enable"
+
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10

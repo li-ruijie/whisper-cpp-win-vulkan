@@ -45,7 +45,9 @@ whisper-cli -m ggml-base.en.bin -f audio.wav
 A GitHub Actions workflow checks upstream daily and builds any semantic release that has no
 release here yet. It compiles with MSVC using upstream's Windows x64 configuration plus
 `GGML_VULKAN`, with SDL2 and the LunarG Vulkan SDK as the only external inputs. A manual run
-takes a `version` override and a `force` flag, the latter rebuilding a release in place.
+takes a `version` override and a `force` flag, the latter rebuilding a release in place. A
+`keepalive` job re-enables the workflow on every run, since GitHub disables the schedule of a
+repository that sees no activity for 60 days.
 
 Before publishing, the workflow checks that ggml-vulkan.dll imports nothing beyond the Vulkan
 loader, ggml, and the C++ runtime, and transcribes a sample with the packaged `whisper-cli`.
