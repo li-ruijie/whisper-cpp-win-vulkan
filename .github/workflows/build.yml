@@ -292,6 +292,27 @@ jobs:
           # whether a system Vulkan loader exists, since without one ggml skips
           # the Vulkan backend silently and this run covers that fallback.
           Write-Host "System Vulkan loader present: $(Test-Path "$env:SystemRoot\System32\vulkan-1.dll")"
+
+          # A release build of ggml drops a backend silently whether the DLL
+          # fails to load or Vulkan finds no driver, and this runner has no
+          # driver, so whisper-cli alone cannot show the backend is loadable.
+          # Loading it directly proves every import resolves.
+          Add-Type -Namespace Native -Name Kernel32 -MemberDefinition @'
+          [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+          public static extern IntPtr LoadLibraryExW(string path, IntPtr file, uint flags);
+          [DllImport("kernel32.dll", CharSet = CharSet.Ansi)]
+          public static extern IntPtr GetProcAddress(IntPtr module, string name);
+          '@
+          # LOAD_WITH_ALTERED_SEARCH_PATH, so ggml-base.dll resolves beside it.
+          $h = [Native.Kernel32]::LoadLibraryExW("$dir\ggml-vulkan.dll", [IntPtr]::Zero, 0x8)
+          if ($h -eq [IntPtr]::Zero) {
+            $err = [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+            throw "ggml-vulkan.dll failed to load, Win32 error $err"
+          }
+          if ([Native.Kernel32]::GetProcAddress($h, 'ggml_backend_init') -eq [IntPtr]::Zero) {
+            throw "ggml-vulkan.dll does not export ggml_backend_init"
+          }
+          Write-Host "ggml-vulkan.dll loads and exports ggml_backend_init"
           $env:PATH = ($env:PATH -split ';' | Where-Object { $_ -notmatch 'VulkanSDK' }) -join ';'
           $text = & "$dir\whisper-cli.exe" -m $model -f whisper.cpp\samples\jfk.wav -nt `
                     2> "$env:RUNNER_TEMP\stderr.log"
