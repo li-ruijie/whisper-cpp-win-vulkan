@@ -4,6 +4,18 @@ Builds [whisper.cpp](https://github.com/ggml-org/whisper.cpp) for 64-bit Windows
 backend, which upstream does not publish for Windows. Each release tracks an upstream semantic
 release and carries its tag, so `v1.9.5` here is built from upstream `v1.9.5`.
 
+## Installing
+
+The `li-ruijie` Scoop bucket carries the release as `whisper-cpp-vulkan`, which puts the
+`whisper-*` tools on PATH and follows new releases automatically.
+
+```powershell
+scoop bucket add li-ruijie https://github.com/li-ruijie/scoop
+scoop install whisper-cpp-vulkan
+```
+
+Without Scoop, download the zip from the latest release and extract it anywhere.
+
 ## Release assets
 
 ┌────────────────────────────────┬──────────────────────────────────────────────────────┐
@@ -50,9 +62,11 @@ takes a `version` override and a `force` flag, the latter rebuilding a release i
 repository that sees no activity for 60 days.
 
 Before publishing, the workflow checks that ggml-vulkan.dll imports nothing beyond the Vulkan
-loader, ggml, and the C++ runtime, and transcribes a sample with the packaged `whisper-cli`.
-The build machine has no GPU, so that test covers the CPU path and confirms that the Vulkan
-backend does not prevent startup. Vulkan execution itself is not tested.
+loader, ggml, and the C++ runtime, loads it from the packaged zip to prove every import
+resolves, and transcribes a sample with the packaged `whisper-cli`. The build machine has no
+GPU, so that test covers the CPU path and confirms that the Vulkan backend does not prevent
+startup. Vulkan execution was confirmed by hand on an Intel Iris Xe for v1.9.5, where encoding
+ran seven to eight times faster than on the CPU, and the workflow does not repeat that check.
 
 ## Licence
 
