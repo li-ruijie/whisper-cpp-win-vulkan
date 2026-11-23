@@ -1,0 +1,16 @@
+# Secrets
+.env
+.env.*
+
+# Vim swap and undo files
+*~
+*.swp
+*.swo
+*.un~
+
+# Backup and tool directories
+.vbak/
+.asst/
+.claude/
+.devc-scripts/
+.devcontainer/
